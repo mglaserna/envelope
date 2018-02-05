@@ -1,5 +1,5 @@
 /**
- * Copyright © 2016-2017 Cloudera, Inc.
+ * Copyright © 2016-2018 Cloudera, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@
  */
 package com.cloudera.labs.envelope.run;
 
+import java.io.IOException;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.sql.Dataset;
@@ -48,6 +50,14 @@ import com.typesafe.config.ConfigObject;
 import com.typesafe.config.ConfigValue;
 import com.typesafe.config.ConfigValueType;
 
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.AclStatus;
+import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.conf.Configuration;
+
+
 /**
  * Runner merely submits the pipeline steps to Spark in dependency order.
  * Ultimately the DAG scheduling is being coordinated by Spark, not Envelope.
@@ -60,8 +70,16 @@ public class Runner {
   public static final String LOOP_TYPE = "loop";
   public static final String DECISION_TYPE = "decision";
   public static final String PIPELINE_THREADS_PROPERTY = "application.pipeline.threads";
-  
+  public static final String GRACEFULSTOP_CHECKINTERVAL_PROPERTY = "application.gracefulstop.checkinterval";
+  public static final String GRACEFULSTOP_CHECKTYPE_PROPERTY = "application.gracefulstop.checktype";
+  public static final String GRACEFULSTOP_HDFS_FILENAME_PROPERTY = "application.gracefulstop.hdfs.filename";
+
+
   private static ExecutorService threadPool;
+  private static Integer CheckTimeout ;
+  private static String CheckType ;
+  private static String HdfsFilename ;
+  private static Boolean isStopped = false;
   private static Logger LOG = LoggerFactory.getLogger(Runner.class);
 
   /**
@@ -83,8 +101,8 @@ public class Runner {
 
     if (StepUtils.hasStreamingStep(steps)) {
       LOG.debug("Streaming step(s) identified");
-
-      runStreaming(steps);
+      initializeGracefulstopCheckinterval(config);
+      runStreaming(steps,config);
     }
     else {
       LOG.debug("No streaming steps identified");
@@ -157,7 +175,7 @@ public class Runner {
    * @param steps The full configuration of the Envelope pipeline
    */
   @SuppressWarnings("unchecked")
-  private static void runStreaming(final Set<Step> steps) throws Exception {
+  private static void runStreaming(final Set<Step> steps, Config config) throws Exception {
     final Set<Step> independentNonStreamingSteps = StepUtils.getIndependentNonStreamingSteps(steps);
     runBatch(independentNonStreamingSteps);
 
@@ -201,9 +219,18 @@ public class Runner {
 
     JavaStreamingContext jsc = Contexts.getJavaStreamingContext();
     jsc.start();
-    LOG.debug("Streaming context started");
-    jsc.awaitTermination();
-    LOG.debug("Streaming context terminated");
+    LOG.info("Streaming context started");
+    while (!isStopped) {
+      if ( CheckTimeout != null ) {
+        isStopped = jsc.awaitTerminationOrTimeout(CheckTimeout);
+        if (!isStopped && isShutdownRequested(config)) {
+          LOG.info("Stopping Context");
+          jsc.stop(true, true);
+        }
+      }
+      else jsc.awaitTermination();
+    }
+    LOG.info("Streaming context terminated");
   }
 
   /**
@@ -302,6 +329,46 @@ public class Runner {
       threadPool = Executors.newFixedThreadPool(20);
     }
   }
+
+  private static void initializeGracefulstopCheckinterval(Config config) {
+    if (config.hasPath(GRACEFULSTOP_CHECKINTERVAL_PROPERTY)) {
+      CheckTimeout = config.getInt(GRACEFULSTOP_CHECKINTERVAL_PROPERTY);
+      LOG.debug("GRACEFULSTOP_CHECKINTERVAL_PROPERTY: " + CheckTimeout.toString());
+    }
+    else CheckTimeout = null;
+  }
+
+  private static Boolean isShutdownRequested(Config config) throws IOException {
+
+    if (config.hasPath(GRACEFULSTOP_CHECKTYPE_PROPERTY)) {
+      CheckType = config.getString(GRACEFULSTOP_CHECKTYPE_PROPERTY).trim();
+      LOG.debug("GRACEFULSTOP_CHECKTYPE_PROPERTY: " + CheckType);
+    }
+    else
+      throw new RuntimeException("Graceful Stop requires '" + GRACEFULSTOP_CHECKTYPE_PROPERTY + "' property");
+
+    if ( CheckType.equals("hdfs") )  {
+      if (config.hasPath(GRACEFULSTOP_HDFS_FILENAME_PROPERTY)) {
+        HdfsFilename = config.getString(GRACEFULSTOP_HDFS_FILENAME_PROPERTY).trim();
+        LOG.debug("GRACEFULSTOP_HDFS_FILENAME_PROPERTY: " + HdfsFilename);
+      }
+      else throw new RuntimeException("Graceful Stop for HDFS requires '" + GRACEFULSTOP_HDFS_FILENAME_PROPERTY + "' property");
+
+      FileSystem fs = FileSystem.get(new Configuration());
+      Path termTriggerPath = new Path(HdfsFilename);
+      LOG.info("Checking presence of Graceful shutdown trigger file " + HdfsFilename);
+      Boolean fileExists = fs.exists(termTriggerPath);
+      if (fileExists) {
+        LOG.info("Graceful shutdown trigger file detected");
+        Path acceptedTriggerName = new Path( termTriggerPath.toString() + "_" + System.currentTimeMillis());
+        fs.rename(termTriggerPath,acceptedTriggerName);
+        LOG.info("Renamed shutdown trigger file to " + acceptedTriggerName.toString() );
+        return fileExists;
+      }
+    }
+    return false;
+  }
+
 
   private static Future<Void> runStepOffMainThread(final BatchStep step, final Set<Step> dependencies, final ExecutorService threadPool) {
     return threadPool.submit(new Callable<Void>() {

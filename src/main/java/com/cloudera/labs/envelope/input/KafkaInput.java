@@ -1,5 +1,5 @@
 /**
- * Copyright © 2016-2017 Cloudera, Inc.
+ * Copyright © 2016-2018 Cloudera, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,6 +49,8 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.typesafe.config.Config;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import scala.Tuple2;
 
 public class KafkaInput implements StreamInput, CanRecordProgress {
@@ -68,6 +70,8 @@ public class KafkaInput implements StreamInput, CanRecordProgress {
   private String topic;
   private OffsetRange[] offsetRanges;
   private RandomOutput offsetsOutput;
+
+  private static Logger LOG = LoggerFactory.getLogger(KafkaInput.class);
 
   @Override
   public void configure(Config config) {
@@ -182,8 +186,15 @@ public class KafkaInput implements StreamInput, CanRecordProgress {
 
   @Override
   public void stageProgress(JavaRDD<?> batch) {
-    if (doesRecordProgress()) {
-      offsetRanges = ((HasOffsetRanges)batch.rdd()).offsetRanges();
+    LOG.info("In stageProgress function call ");
+    offsetRanges = ((HasOffsetRanges) batch.rdd()).offsetRanges();
+    if (null == offsetRanges) {
+      LOG.info("No Offsets found.");
+    } else {
+      LOG.info("Kafka Offsets: ");
+      for (OffsetRange o : offsetRanges) {
+        LOG.info("Topic = " + o.topic() + ", Partition = " + o.partition() + ", fromOffset = " + o.fromOffset() + ", untilOffset = " + o.untilOffset());
+      }
     }
   }
 
